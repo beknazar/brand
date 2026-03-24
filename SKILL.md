@@ -268,32 +268,65 @@ Generate logos ONLY after the user approves brand direction from Phase 3.
 
 If Gemini is not available (from Phase 0), skip to Phase 5 and note: "Logo generation skipped. You can add logos manually or rerun /brand after setting GEMINI_API_KEY."
 
-**Step 1: Write the generation script**
+**Step 1: Write the unified brand toolkit script**
 
-Write to `/tmp/brand-logo-gen.py`:
+Write to `/tmp/brand-toolkit.py`. This single script handles both logo generation (via Gemini) and asset pipeline (resizing, compression, social images). Two subcommands: `generate` and `assets`.
 
 ```python
 #!/usr/bin/env python3
-"""Brand logo + asset generator using Google Gemini API."""
-import sys, os, json, io
+"""Unified brand toolkit: logo generation + web asset pipeline."""
+import sys, os, json, io, subprocess
 
-try:
+if len(sys.argv) < 2:
+    print("Usage: brand-toolkit.py <generate|assets> <json_config>")
+    sys.exit(1)
+
+def ensure_deps():
+    try:
+        from PIL import Image
+        return True
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "Pillow"])
+        return True
+
+def ensure_genai():
+    try:
+        from google import genai
+        return True
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "google-genai"])
+        return True
+
+def hex_to_rgb(h):
+    if not h or not isinstance(h, str):
+        return (255, 255, 255)
+    h = h.lstrip("#")
+    if len(h) == 3:
+        h = h[0]*2 + h[1]*2 + h[2]*2
+    if len(h) != 6:
+        return (255, 255, 255)
+    try:
+        return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return (255, 255, 255)
+
+# ── GENERATE subcommand ──────────────────────────────────
+def cmd_generate(config):
+    ensure_deps()
+    ensure_genai()
     from google import genai
     from google.genai import types
     from PIL import Image
-except ImportError:
-    os.system(f"{sys.executable} -m pip install -q google-genai Pillow")
-    from google import genai
-    from google.genai import types
-    from PIL import Image
 
-def generate_image(prompt, output_path, size=None):
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         print("ERROR: GEMINI_API_KEY not set")
         sys.exit(1)
 
     client = genai.Client(api_key=api_key)
+    prompt = config.get("prompt", "")
+    output_path = config.get("output", "/tmp/brand-logo.png")
+    size = config.get("size")
 
     try:
         response = client.models.generate_content(
@@ -315,13 +348,11 @@ def generate_image(prompt, output_path, size=None):
         if hasattr(part, "inline_data") and part.inline_data:
             try:
                 img = Image.open(io.BytesIO(part.inline_data.data)).convert("RGBA")
-                # Resize to target if specified
                 if size:
                     img = img.resize((size, size), Image.LANCZOS)
                 img.save(output_path, format="PNG", optimize=True)
                 w, h = img.size
-                fsize = os.path.getsize(output_path)
-                print(f"OK: {output_path} ({w}x{h}, {fsize // 1024}KB)")
+                print(f"OK: {output_path} ({w}x{h}, {os.path.getsize(output_path) // 1024}KB)")
                 return
             except Exception as e:
                 print(f"SAVE_ERROR: {e}")
@@ -330,9 +361,159 @@ def generate_image(prompt, output_path, size=None):
     print("NO_IMAGE: Response had no image data")
     sys.exit(5)
 
+# ── ASSETS subcommand ────────────────────────────────────
+def cmd_assets(config):
+    ensure_deps()
+    from PIL import Image
+
+    logo_path = config.get("logo")
+    output_dir = config.get("output", "/tmp/brand-assets")
+    brand_color = config.get("color", "#ffffff")
+    brand_name = config.get("name", "")
+
+    if not logo_path or not os.path.exists(logo_path):
+        print(f"ERROR: Logo file not found: {logo_path}")
+        sys.exit(1)
+
+    os.makedirs(output_dir, exist_ok=True)
+    src = Image.open(logo_path).convert("RGBA")
+    total_bytes = 0
+    files = []
+
+    def save(img, name, fmt="PNG", quality=None, size=None):
+        nonlocal total_bytes
+        if size:
+            img = img.resize((size, size), Image.LANCZOS)
+        path = os.path.join(output_dir, name)
+        kw = {}
+        if fmt == "WEBP":
+            kw = {"quality": quality or 85, "method": 6}
+        elif fmt == "JPEG":
+            kw = {"quality": quality or 90, "optimize": True}
+            if img.mode == "RGBA":
+                bg = Image.new("RGB", img.size, (255, 255, 255))
+                bg.paste(img, mask=img.split()[3])
+                img = bg
+        elif fmt == "PNG":
+            kw = {"optimize": True}
+        img.save(path, format=fmt, **kw)
+        w, h = img.size
+        fsize = os.path.getsize(path)
+        total_bytes += fsize
+        files.append((name, f"{w}x{h}", fsize))
+        print(f"OK: {name} ({w}x{h}, {fsize // 1024}KB, {fmt})")
+        return img
+
+    # ── Favicons (reuse resized results for .ico) ──
+    fav16 = save(src, "favicon-16x16.png", size=16)
+    fav32 = save(src, "favicon-32x32.png", size=32)
+    fav48 = save(src, "favicon-48x48.png", size=48)
+    fav256 = src.resize((256, 256), Image.LANCZOS)
+
+    ico_path = os.path.join(output_dir, "favicon.ico")
+    fav16.save(ico_path, format="ICO",
+        sizes=[(16,16),(32,32),(48,48),(256,256)],
+        append_images=[fav32, fav48, fav256])
+    fsize = os.path.getsize(ico_path)
+    total_bytes += fsize
+    files.append(("favicon.ico", "multi", fsize))
+    print(f"OK: favicon.ico (16+32+48+256, {fsize // 1024}KB)")
+
+    # ── App icons ──
+    save(src, "apple-touch-icon.png", size=180)
+    save(src, "android-chrome-192x192.png", size=192)
+    save(src, "android-chrome-512x512.png", size=512)
+
+    # ── Logo variants (resize once per size, save PNG + WebP) ──
+    for sz in [64, 128, 256, 512, 1024]:
+        resized = src.resize((sz, sz), Image.LANCZOS)
+        save(resized, f"logo-{sz}.png")
+        if sz <= 512:
+            save(resized, f"logo-{sz}.webp", fmt="WEBP", quality=85 if sz >= 512 else 90)
+
+    # ── Social / OG images (reuse intermediates) ──
+    color_rgb = hex_to_rgb(brand_color)
+    logo_300 = src.resize((300, 300), Image.LANCZOS)
+    logo_540 = src.resize((540, 540), Image.LANCZOS)
+
+    # OG image: 1200x630
+    og = Image.new("RGB", (1200, 630), color_rgb)
+    og.paste(logo_300, (450, 165), logo_300)
+    save(og, "og-image.jpg", fmt="JPEG", quality=85)
+    save(og, "og-image.webp", fmt="WEBP", quality=80)
+
+    # Twitter card: 1200x600
+    tw = Image.new("RGB", (1200, 600), color_rgb)
+    tw.paste(logo_300, (450, 150), logo_300)
+    save(tw, "twitter-card.jpg", fmt="JPEG", quality=85)
+
+    # Square social: 1080x1080
+    sq = Image.new("RGB", (1080, 1080), color_rgb)
+    sq.paste(logo_540, (270, 270), logo_540)
+    save(sq, "social-square.jpg", fmt="JPEG", quality=85)
+    save(sq, "social-square.webp", fmt="WEBP", quality=80)
+
+    # ── Manifest files ──
+    manifest = {
+        "name": brand_name,
+        "short_name": brand_name,
+        "icons": [
+            {"src": "/android-chrome-192x192.png", "sizes": "192x192", "type": "image/png"},
+            {"src": "/android-chrome-512x512.png", "sizes": "512x512", "type": "image/png"}
+        ],
+        "theme_color": brand_color,
+        "background_color": "#ffffff",
+        "display": "standalone"
+    }
+    with open(os.path.join(output_dir, "site.webmanifest"), "w") as f:
+        json.dump(manifest, f, indent=2)
+    print("OK: site.webmanifest")
+
+    with open(os.path.join(output_dir, "browserconfig.xml"), "w") as f:
+        f.write(f'<?xml version="1.0" encoding="utf-8"?>\n')
+        f.write(f'<browserconfig><msapplication><tile>\n')
+        f.write(f'<square150x150logo src="/android-chrome-192x192.png"/>\n')
+        f.write(f'<TileColor>{brand_color}</TileColor>\n')
+        f.write(f'</tile></msapplication></browserconfig>\n')
+    print("OK: browserconfig.xml")
+
+    with open(os.path.join(output_dir, "head-tags.html"), "w") as f:
+        f.write('<!-- Favicon and brand assets - copy into <head> -->\n')
+        f.write('<link rel="icon" type="image/x-icon" href="/favicon.ico">\n')
+        f.write('<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">\n')
+        f.write('<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">\n')
+        f.write('<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">\n')
+        f.write('<link rel="manifest" href="/site.webmanifest">\n')
+        f.write(f'<meta name="theme-color" content="{brand_color}">\n')
+        f.write(f'<meta name="msapplication-TileColor" content="{brand_color}">\n')
+        f.write('<meta property="og:image" content="/og-image.jpg">\n')
+        f.write('<meta property="og:image:width" content="1200">\n')
+        f.write('<meta property="og:image:height" content="630">\n')
+        f.write('<meta name="twitter:card" content="summary_large_image">\n')
+        f.write('<meta name="twitter:image" content="/twitter-card.jpg">\n')
+    print("OK: head-tags.html")
+
+    # ── Report ──
+    print(f"\nTOTAL: {len(files)} files, {total_bytes // 1024}KB")
+    for name, dims, sz in sorted(files, key=lambda x: -x[2]):
+        print(f"  {name:40s} {dims:>10s}  {sz // 1024:>5d}KB")
+
+# ── Entry point ──────────────────────────────────────────
 if __name__ == "__main__":
-    config = json.loads(sys.argv[1])
-    generate_image(config["prompt"], config["output"], config.get("size"))
+    cmd = sys.argv[1]
+    try:
+        config = json.loads(sys.argv[2]) if len(sys.argv) > 2 else {}
+    except json.JSONDecodeError as e:
+        print(f"ERROR: Invalid JSON config: {e}")
+        sys.exit(1)
+
+    if cmd == "generate":
+        cmd_generate(config)
+    elif cmd == "assets":
+        cmd_assets(config)
+    else:
+        print(f"ERROR: Unknown command '{cmd}'. Use 'generate' or 'assets'.")
+        sys.exit(1)
 ```
 
 **Step 2: Craft logo prompts**
@@ -358,12 +539,15 @@ Requirements:
 This is for a tech product. It should look like it belongs on a $10B company, not a template marketplace.
 ```
 
-**Step 3: Generate 3 variations**
+**Step 3: Generate 3 variations in parallel**
+
+Run all three Gemini calls concurrently to cut wall-clock time by ~66%:
 
 ```bash
-python3 /tmp/brand-logo-gen.py '{"prompt":"PROMPT_V1","output":"/tmp/brand-logo-v1.png"}' 2>&1
-python3 /tmp/brand-logo-gen.py '{"prompt":"PROMPT_V2","output":"/tmp/brand-logo-v2.png"}' 2>&1
-python3 /tmp/brand-logo-gen.py '{"prompt":"PROMPT_V3","output":"/tmp/brand-logo-v3.png"}' 2>&1
+python3 /tmp/brand-toolkit.py generate '{"prompt":"PROMPT_V1","output":"/tmp/brand-logo-v1.png"}' 2>&1 &
+python3 /tmp/brand-toolkit.py generate '{"prompt":"PROMPT_V2","output":"/tmp/brand-logo-v2.png"}' 2>&1 &
+python3 /tmp/brand-toolkit.py generate '{"prompt":"PROMPT_V3","output":"/tmp/brand-logo-v3.png"}' 2>&1 &
+wait
 ```
 
 Each prompt should be a different direction:
@@ -426,175 +610,15 @@ If no logo was generated, skip this phase.
 
 **Step 1: Write the asset pipeline script**
 
-Write to `/tmp/brand-assets-gen.py`:
-
-```python
-#!/usr/bin/env python3
-"""Generate complete web asset set from logo with proper sizes and compression."""
-import sys, os, json
-from PIL import Image
-
-logo_path = sys.argv[1]
-output_dir = sys.argv[2]
-brand_color = sys.argv[3] if len(sys.argv) > 3 else "#ffffff"
-os.makedirs(output_dir, exist_ok=True)
-
-src = Image.open(logo_path).convert("RGBA")
-report = {"files": [], "total_bytes": 0}
-
-def save(img, name, fmt="PNG", quality=None, resize=None):
-    if resize:
-        img = img.resize((resize, resize), Image.LANCZOS)
-    path = os.path.join(output_dir, name)
-    kwargs = {"optimize": True}
-    if fmt == "WEBP":
-        kwargs["quality"] = quality or 85
-        kwargs["method"] = 6
-    elif fmt == "PNG":
-        kwargs["optimize"] = True
-    elif fmt == "JPEG":
-        kwargs["quality"] = quality or 90
-        kwargs["optimize"] = True
-        # JPEG needs RGB, composite onto white
-        if img.mode == "RGBA":
-            bg = Image.new("RGB", img.size, (255, 255, 255))
-            bg.paste(img, mask=img.split()[3])
-            img = bg
-    img.save(path, format=fmt, **kwargs)
-    fsize = os.path.getsize(path)
-    w, h = img.size if not resize else (resize, resize)
-    report["files"].append({"name": name, "size": f"{w}x{h}", "bytes": fsize})
-    report["total_bytes"] += fsize
-    print(f"OK: {name} ({w}x{h}, {fsize // 1024}KB, {fmt})")
-    return img
-
-# === FAVICONS (must be pixel-perfect at small sizes) ===
-save(src, "favicon-16x16.png", resize=16)
-save(src, "favicon-32x32.png", resize=32)
-save(src, "favicon-48x48.png", resize=48)
-
-# Multi-size .ico (16+32+48)
-ico_imgs = [src.resize((s, s), Image.LANCZOS) for s in [16, 32, 48]]
-ico_path = os.path.join(output_dir, "favicon.ico")
-ico_imgs[0].save(ico_path, format="ICO",
-    sizes=[(16, 16), (32, 32), (48, 48)], append_images=ico_imgs[1:])
-fsize = os.path.getsize(ico_path)
-report["files"].append({"name": "favicon.ico", "size": "multi", "bytes": fsize})
-report["total_bytes"] += fsize
-print(f"OK: favicon.ico (multi-size, {fsize // 1024}KB)")
-
-# SVG favicon placeholder (text file with instructions)
-svg_path = os.path.join(output_dir, "favicon.svg.txt")
-with open(svg_path, "w") as f:
-    f.write("<!-- Replace this with a hand-crafted SVG version of your logo -->\n")
-    f.write("<!-- SVG favicons support dark mode via prefers-color-scheme -->\n")
-print("OK: favicon.svg.txt (placeholder)")
-
-# === APPLE / ANDROID ICONS ===
-save(src, "apple-touch-icon.png", resize=180)
-save(src, "android-chrome-192x192.png", resize=192)
-save(src, "android-chrome-512x512.png", resize=512)
-
-# === LOGO VARIANTS (multiple sizes for different uses) ===
-save(src, "logo-64.png", resize=64)              # Navbar, small UI
-save(src, "logo-128.png", resize=128)             # Medium UI, email headers
-save(src, "logo-256.png", resize=256)             # Large UI, about pages
-save(src, "logo-512.png", resize=512)             # High-res, retina
-save(src, "logo-1024.png", resize=1024)           # Print, marketing
-
-# WebP versions (smaller file size for web)
-save(src, "logo-64.webp", fmt="WEBP", resize=64, quality=90)
-save(src, "logo-128.webp", fmt="WEBP", resize=128, quality=90)
-save(src, "logo-256.webp", fmt="WEBP", resize=256, quality=90)
-save(src, "logo-512.webp", fmt="WEBP", resize=512, quality=85)
-
-# === SOCIAL / OG IMAGES ===
-# OG image: 1200x630 (logo centered on brand-colored background)
-def hex_to_rgb(h):
-    h = h.lstrip("#")
-    return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
-
-og = Image.new("RGB", (1200, 630), hex_to_rgb(brand_color))
-logo_for_og = src.resize((300, 300), Image.LANCZOS)
-x = (1200 - 300) // 2
-y = (630 - 300) // 2
-og.paste(logo_for_og, (x, y), logo_for_og)
-save(og, "og-image.png", fmt="PNG")
-save(og, "og-image.jpg", fmt="JPEG", quality=85)
-save(og, "og-image.webp", fmt="WEBP", quality=80)
-
-# Twitter card: 1200x600
-tw = Image.new("RGB", (1200, 600), hex_to_rgb(brand_color))
-tw.paste(logo_for_og, (x, (600 - 300) // 2), logo_for_og)
-save(tw, "twitter-card.jpg", fmt="JPEG", quality=85)
-
-# Square social: 1080x1080 (Instagram, etc.)
-sq = Image.new("RGB", (1080, 1080), hex_to_rgb(brand_color))
-logo_sq = src.resize((540, 540), Image.LANCZOS)
-sq.paste(logo_sq, (270, 270), logo_sq)
-save(sq, "social-square.jpg", fmt="JPEG", quality=85)
-save(sq, "social-square.webp", fmt="WEBP", quality=80)
-
-# === MANIFEST FILES ===
-manifest = {
-    "name": "",
-    "short_name": "",
-    "icons": [
-        {"src": "/android-chrome-192x192.png", "sizes": "192x192", "type": "image/png"},
-        {"src": "/android-chrome-512x512.png", "sizes": "512x512", "type": "image/png"}
-    ],
-    "theme_color": brand_color,
-    "background_color": "#ffffff",
-    "display": "standalone"
-}
-manifest_path = os.path.join(output_dir, "site.webmanifest")
-with open(manifest_path, "w") as f:
-    json.dump(manifest, f, indent=2)
-print("OK: site.webmanifest")
-
-# browserconfig.xml for Microsoft
-bc_path = os.path.join(output_dir, "browserconfig.xml")
-with open(bc_path, "w") as f:
-    f.write(f'<?xml version="1.0" encoding="utf-8"?>\n')
-    f.write(f'<browserconfig><msapplication><tile>\n')
-    f.write(f'<square150x150logo src="/android-chrome-192x192.png"/>\n')
-    f.write(f'<TileColor>{brand_color}</TileColor>\n')
-    f.write(f'</tile></msapplication></browserconfig>\n')
-print("OK: browserconfig.xml")
-
-# === HEAD TAG SNIPPET ===
-head_path = os.path.join(output_dir, "head-tags.html")
-with open(head_path, "w") as f:
-    f.write('<!-- Favicon and brand assets - copy into <head> -->\n')
-    f.write('<link rel="icon" type="image/x-icon" href="/favicon.ico">\n')
-    f.write('<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">\n')
-    f.write('<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">\n')
-    f.write('<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">\n')
-    f.write('<link rel="manifest" href="/site.webmanifest">\n')
-    f.write(f'<meta name="theme-color" content="{brand_color}">\n')
-    f.write(f'<meta name="msapplication-TileColor" content="{brand_color}">\n')
-    f.write('<meta property="og:image" content="/og-image.jpg">\n')
-    f.write('<meta property="og:image:width" content="1200">\n')
-    f.write('<meta property="og:image:height" content="630">\n')
-    f.write('<meta name="twitter:card" content="summary_large_image">\n')
-    f.write('<meta name="twitter:image" content="/twitter-card.jpg">\n')
-print("OK: head-tags.html")
-
-# === REPORT ===
-total_kb = report["total_bytes"] // 1024
-print(f"\nTOTAL: {len(report['files'])} files, {total_kb}KB")
-print(f"\nFile sizes:")
-for f in sorted(report["files"], key=lambda x: -x["bytes"]):
-    print(f"  {f['name']:40s} {f['size']:>10s}  {f['bytes'] // 1024:>5d}KB")
-```
+The `assets` subcommand of `brand-toolkit.py` (written in Phase 4) handles all asset generation.
 
 **Step 2: Run it**
 
 ```bash
-python3 /tmp/brand-assets-gen.py "/tmp/brand-logo-chosen.png" "/tmp/brand-assets/" "#PRIMARY_HEX" 2>&1
+python3 /tmp/brand-toolkit.py assets '{"logo":"/tmp/brand-logo-chosen.png","output":"/tmp/brand-assets","color":"#PRIMARY_HEX","name":"BRAND_NAME"}' 2>&1
 ```
 
-Replace `#PRIMARY_HEX` with the primary brand color from Phase 3.
+Replace `#PRIMARY_HEX` with the primary brand color and `BRAND_NAME` with the project name from Phase 3.
 
 If the logo is too complex for 16px favicon (check the 16x16 output), generate a separate simplified icon via Gemini with a prompt focused on minimal single-shape mark. Then rerun the script with the simplified icon for favicon sizes only.
 
