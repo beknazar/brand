@@ -274,7 +274,7 @@ Write to `/tmp/brand-logo-gen.py`:
 
 ```python
 #!/usr/bin/env python3
-"""Brand logo generator using Google Gemini API (gemini-2.0-flash-exp)."""
+"""Brand logo + asset generator using Google Gemini API."""
 import sys, os, json, io
 
 try:
@@ -287,7 +287,7 @@ except ImportError:
     from google.genai import types
     from PIL import Image
 
-def generate_logo(prompt, output_path):
+def generate_image(prompt, output_path, size=None):
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         print("ERROR: GEMINI_API_KEY not set")
@@ -314,9 +314,14 @@ def generate_logo(prompt, output_path):
     for part in response.candidates[0].content.parts:
         if hasattr(part, "inline_data") and part.inline_data:
             try:
-                img = Image.open(io.BytesIO(part.inline_data.data))
-                img.save(output_path, format="PNG")
-                print(f"OK: {output_path}")
+                img = Image.open(io.BytesIO(part.inline_data.data)).convert("RGBA")
+                # Resize to target if specified
+                if size:
+                    img = img.resize((size, size), Image.LANCZOS)
+                img.save(output_path, format="PNG", optimize=True)
+                w, h = img.size
+                fsize = os.path.getsize(output_path)
+                print(f"OK: {output_path} ({w}x{h}, {fsize // 1024}KB)")
                 return
             except Exception as e:
                 print(f"SAVE_ERROR: {e}")
@@ -327,7 +332,7 @@ def generate_logo(prompt, output_path):
 
 if __name__ == "__main__":
     config = json.loads(sys.argv[1])
-    generate_logo(config["prompt"], config["output"])
+    generate_image(config["prompt"], config["output"], config.get("size"))
 ```
 
 **Step 2: Craft logo prompts**
@@ -413,61 +418,185 @@ If the user wants to refine, write a new prompt incorporating their feedback and
 
 ---
 
-## Phase 5: Favicon generation
+## Phase 5: Favicon and web asset generation
 
-After logo is approved (or skipped), generate favicon set.
+After logo is approved (or skipped), generate the complete web asset set.
 
 If no logo was generated, skip this phase.
 
-**Step 1: Write favicon script**
+**Step 1: Write the asset pipeline script**
 
-Write to `/tmp/brand-favicon-gen.py`:
+Write to `/tmp/brand-assets-gen.py`:
 
 ```python
 #!/usr/bin/env python3
-"""Generate favicon set from logo."""
-import sys, os
+"""Generate complete web asset set from logo with proper sizes and compression."""
+import sys, os, json
 from PIL import Image
 
 logo_path = sys.argv[1]
 output_dir = sys.argv[2]
+brand_color = sys.argv[3] if len(sys.argv) > 3 else "#ffffff"
 os.makedirs(output_dir, exist_ok=True)
 
-img = Image.open(logo_path).convert("RGBA")
+src = Image.open(logo_path).convert("RGBA")
+report = {"files": [], "total_bytes": 0}
 
-sizes = {
-    "favicon-16x16.png": 16,
-    "favicon-32x32.png": 32,
-    "favicon-48x48.png": 48,
-    "apple-touch-icon.png": 180,
-    "android-chrome-192x192.png": 192,
-    "android-chrome-512x512.png": 512,
-    "og-icon.png": 512,
+def save(img, name, fmt="PNG", quality=None, resize=None):
+    if resize:
+        img = img.resize((resize, resize), Image.LANCZOS)
+    path = os.path.join(output_dir, name)
+    kwargs = {"optimize": True}
+    if fmt == "WEBP":
+        kwargs["quality"] = quality or 85
+        kwargs["method"] = 6
+    elif fmt == "PNG":
+        kwargs["optimize"] = True
+    elif fmt == "JPEG":
+        kwargs["quality"] = quality or 90
+        kwargs["optimize"] = True
+        # JPEG needs RGB, composite onto white
+        if img.mode == "RGBA":
+            bg = Image.new("RGB", img.size, (255, 255, 255))
+            bg.paste(img, mask=img.split()[3])
+            img = bg
+    img.save(path, format=fmt, **kwargs)
+    fsize = os.path.getsize(path)
+    w, h = img.size if not resize else (resize, resize)
+    report["files"].append({"name": name, "size": f"{w}x{h}", "bytes": fsize})
+    report["total_bytes"] += fsize
+    print(f"OK: {name} ({w}x{h}, {fsize // 1024}KB, {fmt})")
+    return img
+
+# === FAVICONS (must be pixel-perfect at small sizes) ===
+save(src, "favicon-16x16.png", resize=16)
+save(src, "favicon-32x32.png", resize=32)
+save(src, "favicon-48x48.png", resize=48)
+
+# Multi-size .ico (16+32+48)
+ico_imgs = [src.resize((s, s), Image.LANCZOS) for s in [16, 32, 48]]
+ico_path = os.path.join(output_dir, "favicon.ico")
+ico_imgs[0].save(ico_path, format="ICO",
+    sizes=[(16, 16), (32, 32), (48, 48)], append_images=ico_imgs[1:])
+fsize = os.path.getsize(ico_path)
+report["files"].append({"name": "favicon.ico", "size": "multi", "bytes": fsize})
+report["total_bytes"] += fsize
+print(f"OK: favicon.ico (multi-size, {fsize // 1024}KB)")
+
+# SVG favicon placeholder (text file with instructions)
+svg_path = os.path.join(output_dir, "favicon.svg.txt")
+with open(svg_path, "w") as f:
+    f.write("<!-- Replace this with a hand-crafted SVG version of your logo -->\n")
+    f.write("<!-- SVG favicons support dark mode via prefers-color-scheme -->\n")
+print("OK: favicon.svg.txt (placeholder)")
+
+# === APPLE / ANDROID ICONS ===
+save(src, "apple-touch-icon.png", resize=180)
+save(src, "android-chrome-192x192.png", resize=192)
+save(src, "android-chrome-512x512.png", resize=512)
+
+# === LOGO VARIANTS (multiple sizes for different uses) ===
+save(src, "logo-64.png", resize=64)              # Navbar, small UI
+save(src, "logo-128.png", resize=128)             # Medium UI, email headers
+save(src, "logo-256.png", resize=256)             # Large UI, about pages
+save(src, "logo-512.png", resize=512)             # High-res, retina
+save(src, "logo-1024.png", resize=1024)           # Print, marketing
+
+# WebP versions (smaller file size for web)
+save(src, "logo-64.webp", fmt="WEBP", resize=64, quality=90)
+save(src, "logo-128.webp", fmt="WEBP", resize=128, quality=90)
+save(src, "logo-256.webp", fmt="WEBP", resize=256, quality=90)
+save(src, "logo-512.webp", fmt="WEBP", resize=512, quality=85)
+
+# === SOCIAL / OG IMAGES ===
+# OG image: 1200x630 (logo centered on brand-colored background)
+def hex_to_rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+
+og = Image.new("RGB", (1200, 630), hex_to_rgb(brand_color))
+logo_for_og = src.resize((300, 300), Image.LANCZOS)
+x = (1200 - 300) // 2
+y = (630 - 300) // 2
+og.paste(logo_for_og, (x, y), logo_for_og)
+save(og, "og-image.png", fmt="PNG")
+save(og, "og-image.jpg", fmt="JPEG", quality=85)
+save(og, "og-image.webp", fmt="WEBP", quality=80)
+
+# Twitter card: 1200x600
+tw = Image.new("RGB", (1200, 600), hex_to_rgb(brand_color))
+tw.paste(logo_for_og, (x, (600 - 300) // 2), logo_for_og)
+save(tw, "twitter-card.jpg", fmt="JPEG", quality=85)
+
+# Square social: 1080x1080 (Instagram, etc.)
+sq = Image.new("RGB", (1080, 1080), hex_to_rgb(brand_color))
+logo_sq = src.resize((540, 540), Image.LANCZOS)
+sq.paste(logo_sq, (270, 270), logo_sq)
+save(sq, "social-square.jpg", fmt="JPEG", quality=85)
+save(sq, "social-square.webp", fmt="WEBP", quality=80)
+
+# === MANIFEST FILES ===
+manifest = {
+    "name": "",
+    "short_name": "",
+    "icons": [
+        {"src": "/android-chrome-192x192.png", "sizes": "192x192", "type": "image/png"},
+        {"src": "/android-chrome-512x512.png", "sizes": "512x512", "type": "image/png"}
+    ],
+    "theme_color": brand_color,
+    "background_color": "#ffffff",
+    "display": "standalone"
 }
+manifest_path = os.path.join(output_dir, "site.webmanifest")
+with open(manifest_path, "w") as f:
+    json.dump(manifest, f, indent=2)
+print("OK: site.webmanifest")
 
-for name, size in sizes.items():
-    resized = img.resize((size, size), Image.LANCZOS)
-    resized.save(os.path.join(output_dir, name), format="PNG")
-    print(f"OK: {name} ({size}x{size})")
+# browserconfig.xml for Microsoft
+bc_path = os.path.join(output_dir, "browserconfig.xml")
+with open(bc_path, "w") as f:
+    f.write(f'<?xml version="1.0" encoding="utf-8"?>\n')
+    f.write(f'<browserconfig><msapplication><tile>\n')
+    f.write(f'<square150x150logo src="/android-chrome-192x192.png"/>\n')
+    f.write(f'<TileColor>{brand_color}</TileColor>\n')
+    f.write(f'</tile></msapplication></browserconfig>\n')
+print("OK: browserconfig.xml")
 
-# Multi-size .ico
-ico_imgs = [img.resize((s, s), Image.LANCZOS) for s in [16, 32, 48]]
-ico_imgs[0].save(
-    os.path.join(output_dir, "favicon.ico"),
-    format="ICO",
-    sizes=[(16, 16), (32, 32), (48, 48)],
-    append_images=ico_imgs[1:]
-)
-print("OK: favicon.ico (multi-size)")
+# === HEAD TAG SNIPPET ===
+head_path = os.path.join(output_dir, "head-tags.html")
+with open(head_path, "w") as f:
+    f.write('<!-- Favicon and brand assets - copy into <head> -->\n')
+    f.write('<link rel="icon" type="image/x-icon" href="/favicon.ico">\n')
+    f.write('<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">\n')
+    f.write('<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">\n')
+    f.write('<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">\n')
+    f.write('<link rel="manifest" href="/site.webmanifest">\n')
+    f.write(f'<meta name="theme-color" content="{brand_color}">\n')
+    f.write(f'<meta name="msapplication-TileColor" content="{brand_color}">\n')
+    f.write('<meta property="og:image" content="/og-image.jpg">\n')
+    f.write('<meta property="og:image:width" content="1200">\n')
+    f.write('<meta property="og:image:height" content="630">\n')
+    f.write('<meta name="twitter:card" content="summary_large_image">\n')
+    f.write('<meta name="twitter:image" content="/twitter-card.jpg">\n')
+print("OK: head-tags.html")
+
+# === REPORT ===
+total_kb = report["total_bytes"] // 1024
+print(f"\nTOTAL: {len(report['files'])} files, {total_kb}KB")
+print(f"\nFile sizes:")
+for f in sorted(report["files"], key=lambda x: -x["bytes"]):
+    print(f"  {f['name']:40s} {f['size']:>10s}  {f['bytes'] // 1024:>5d}KB")
 ```
 
 **Step 2: Run it**
 
 ```bash
-python3 /tmp/brand-favicon-gen.py "/tmp/brand-logo-chosen.png" "/tmp/brand-favicons/" 2>&1
+python3 /tmp/brand-assets-gen.py "/tmp/brand-logo-chosen.png" "/tmp/brand-assets/" "#PRIMARY_HEX" 2>&1
 ```
 
-If the logo is too complex for 16px (you can tell from the image), generate a separate simplified icon via Gemini with a prompt focused on minimal single-shape mark.
+Replace `#PRIMARY_HEX` with the primary brand color from Phase 3.
+
+If the logo is too complex for 16px favicon (check the 16x16 output), generate a separate simplified icon via Gemini with a prompt focused on minimal single-shape mark. Then rerun the script with the simplified icon for favicon sizes only.
 
 **Step 3: Install into project**
 
@@ -482,17 +611,29 @@ Detect framework:
 
 AskUserQuestion before copying:
 
-> **Brand skill for [project name], Phase 5: Installing favicons.**
+> **Brand skill for [project name], Phase 5: Installing brand assets.**
 >
-> I've generated favicon set (7 sizes + .ico). Ready to copy into your project at [detected path].
+> I've generated a complete web asset set:
+> - Favicons: .ico (multi-size), 16px, 32px, 48px PNG
+> - App icons: apple-touch-icon (180px), Android Chrome (192px, 512px)
+> - Logo variants: 64px to 1024px in PNG + WebP
+> - Social/OG: og-image (1200x630), twitter-card (1200x600), social-square (1080x1080) in JPG + WebP
+> - Config: site.webmanifest, browserconfig.xml, head-tags.html snippet
 >
-> RECOMMENDATION: Choose A to install now.
+> Total: [N] files, [X]KB. WebP versions are 30-50% smaller than PNG.
 >
-> A) Install to [path]
-> B) Save to /tmp/brand-favicons/ only, I'll move them myself
-> C) Skip favicons
+> RECOMMENDATION: Choose A to install to your project.
+>
+> A) Install to [detected public/ path]
+> B) Save to /tmp/brand-assets/ only, I'll move them myself
+> C) Skip asset installation
 
-If A: Copy files. For Next.js App Router, also copy favicon.ico to `app/favicon.ico`.
+If A:
+- Copy favicon files, app icons, and config files to `public/`
+- Copy logo variants to `public/brand/` or `public/images/brand/`
+- Copy OG/social images to `public/`
+- For Next.js App Router: also copy favicon.ico to `app/favicon.ico`
+- Print the content of `head-tags.html` so the user can add it to their layout
 
 ---
 
